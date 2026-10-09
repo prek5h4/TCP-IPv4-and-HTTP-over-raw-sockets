@@ -34,31 +34,51 @@ class PacketLogger:
     def __init__(self, path: Optional[str]) -> None:
         """Open `path` for writing (truncate) if it is not None; otherwise
         remember that logging is off."""
-        raise NotImplementedError
+        self.path = path
+        self.file = None
+        if path is not None:
+            self.file = open(path, "w")
 
     def log_send(self, src: str, sport: int, dst: str, dport: int, ttl: int,
                  ident: int, seq: int, ack: int, flags: int, win: int,
                  length: int, mss: Optional[int]) -> None:
         """Format and write a SEND line."""
-        raise NotImplementedError
+        if self.file is not None:
+            line = self._format("SEND", src, sport, dst, dport, ttl, ident, seq, ack, flags, win, length, mss)
+            self._write(line)
 
     def log_recv(self, src: str, sport: int, dst: str, dport: int, ttl: int,
                  ident: int, seq: int, ack: int, flags: int, win: int,
                  length: int, mss: Optional[int]) -> None:
         """Format and write a RECV line."""
-        raise NotImplementedError
+        if self.file is not None:
+            line = self._format("RECV", src, sport, dst, dport, ttl, ident, seq, ack, flags, win, length, mss)
+            self._write(line)
 
     def _format(self, direction: str, src: str, sport: int, dst: str,
                 dport: int, ttl: int, ident: int, seq: int, ack: int,
                 flags: int, win: int, length: int, mss: Optional[int]) -> str:
         """Return the line described in the module header (no newline).
         Watch: seq/ack unsigned, flags '0x%02x', mss '-' when None."""
-        raise NotImplementedError
+        seq_u = seq & 0xffffffff
+        ack_u = ack & 0xffffffff
+        win_u = win & 0xffff
+        mss_str = str(mss) if mss is not None else "-"
+        flags_str = f"0x{flags:02x}"
+        return f"{direction} {src}:{sport} > {dst}:{dport} ttl={ttl} id={ident} seq={seq_u} ack={ack_u} flags={flags_str} win={win_u} len={length} mss={mss_str}"
 
     def _write(self, line: str) -> None:
         """Write line + newline and flush immediately."""
-        raise NotImplementedError
+        if self.file is not None:
+            self.file.write(line + "\n")
+            self.file.flush()
 
     def close(self) -> None:
         """Close the file (if open)."""
-        raise NotImplementedError
+        if self.file is not None:
+            try:
+                self.file.flush()
+                self.file.close()
+            except Exception:
+                pass
+            self.file = None

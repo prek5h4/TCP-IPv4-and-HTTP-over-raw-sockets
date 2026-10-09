@@ -34,19 +34,31 @@ class RenoCongestion:
     def __init__(self, mss: int) -> None:
         """Start with a small initial window (e.g. 2-10 MSS), a very large
         ssthresh, dup_acks = 0 and not in fast recovery."""
-        raise NotImplementedError
+        self.mss = mss
+        self.cwnd = float(3 * mss)
+        self.ssthresh = 65535.0
+        self.dup_acks = 0
+        self.in_fast_recovery = False
 
     def window(self) -> int:
         """Current congestion window in bytes. The sender may have at most
         min(window(), peer's advertised window) unacknowledged bytes (T10)."""
-        raise NotImplementedError
+        return max(self.mss, int(self.cwnd))
 
     def on_new_ack(self, bytes_acked: int) -> None:
         """The cumulative ACK advanced by bytes_acked. Reset the duplicate-ACK
         counter. If in fast recovery: deflate cwnd to ssthresh and leave
         recovery. Otherwise grow cwnd per the current phase (slow start vs
         congestion avoidance)."""
-        raise NotImplementedError
+        self.dup_acks = 0
+        if self.in_fast_recovery:
+            self.cwnd = self.ssthresh
+            self.in_fast_recovery = False
+        else:
+            if self.cwnd < self.ssthresh:
+                self.cwnd += min(bytes_acked, self.mss)
+            else:
+                self.cwnd += (self.mss * self.mss) / self.cwnd
 
     def on_dup_ack(self, flight_size: int) -> bool:
         """A duplicate ACK arrived (same ack number, no new data acked, data
@@ -54,9 +66,22 @@ class RenoCongestion:
         (see header) and return True so the caller retransmits the first
         unacknowledged segment. During recovery inflate cwnd by 1 MSS per extra
         dup ACK. Otherwise return False. flight_size = bytes currently unacked."""
-        raise NotImplementedError
+        self.dup_acks += 1
+        if self.dup_acks == 3:
+            self.ssthresh = max(float(flight_size // 2), float(2 * self.mss))
+            self.cwnd = self.ssthresh + 3 * self.mss
+            self.in_fast_recovery = True
+            return True
+        elif self.dup_acks > 3:
+            if self.in_fast_recovery:
+                self.cwnd += self.mss
+            return False
+        return False
 
     def on_timeout(self, flight_size: int) -> None:
         """The retransmission timer fired: apply the timeout rule in the header
         and leave fast recovery."""
-        raise NotImplementedError
+        self.ssthresh = max(float(flight_size // 2), float(2 * self.mss))
+        self.cwnd = float(self.mss)
+        self.dup_acks = 0
+        self.in_fast_recovery = False
