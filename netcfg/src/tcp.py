@@ -1,109 +1,58 @@
-"""
-tcp.py - the TCP engine: handshake, reliable transfer, teardown.   (T5-T13)
-
-ROLE
-    One TCPConnection object = one connection (only one at a time is required).
-    The HTTP client/server call connect()/accept(), send(), recv(), close() and
-    never see packets. Everything else (packet building, logging, congestion
-    control) is delegated to packet.py, pktlog.py, congestion.py.
-
-ARCHITECTURE: ONE SINGLE-THREADED EVENT LOOP
-    Every blocking call (connect, send, recv, close) is implemented by looping
-    _pump(): wait for a packet OR the nearest timer deadline, handle whatever
-    happened, repeat until the call's goal is reached. No threads, no locks.
-    Timers are just deadlines (time.monotonic() values) that _next_deadline()
-    collects and _pump() checks after each wake-up.
-
-STATE YOU WILL NEED (suggested names)
-    Endpoints : local_ip, local_port, remote_ip, remote_port
-    State enum: see State below
-    Sending   : iss (random initial seq, T6), snd_una (oldest unacked byte),
-                snd_nxt (next new byte), send_buf (bytes the app queued),
-                inflight (ordered list of SentSegment), peer_mss (default 536
-                until the peer's SYN/SYN-ACK tells you), peer_window
-    Receiving : irs (peer's initial seq), rcv_nxt (next byte expected),
-                ooo (out-of-order buffer: dict seq -> bytes), rx_data (in-order
-                bytes ready for the app), peer_fin_seen
-    Timers    : rto + RTT estimator, retransmission deadline, "last progress"
-                time (10 s give-up, T10), handshake and close deadlines
-
-SEQUENCE NUMBERS
-    32-bit and they WRAP. Never compare with < or >. Use seq_lt/seq_leq below
-    ("a is before b" = (a - b) mod 2^32 has its top bit set). SYN and FIN each
-    consume one sequence number; pure ACKs consume none.
-
-STATE MACHINE (simplified; no TIME_WAIT needed)
-    Client: CLOSED -> SYN_SENT -> ESTABLISHED -> (FIN_WAIT or CLOSE_WAIT) -> DONE
-    Server: CLOSED -> LISTEN -> SYN_RCVD -> ESTABLISHED -> ... -> DONE
-    RST at any time -> ABORTED (T8, immediately, raise TCPError).
-
-TIMING RULES FROM THE ASSIGNMENT
-    T7  handshake : retransmit SYN / SYN-ACK within 1 s; keep trying >= 6 s.
-    T9  teardown  : ACK the peer's FIN. After sending your FIN, retransmit until
-                    acked and wait for the peer's FIN; give up after <= 2 s.
-    T10 sending   : RTO <= 1 s; give up if nothing is acked for 10 s.
-    T11 receiving : advertise a FIXED window of 65535; ACK EVERY data segment
-                    (also duplicate and out-of-order ones) with rcv_nxt.
-
-DEBUGGING ADVICE
-    Build in this order: handshake -> one request/response on a clean network ->
-    teardown -> retransmission -> out-of-order buffering -> congestion control.
-    Keep a capture (tcpdump -nn -w) of every failed run.
-"""
-import enum
-import random
-import time
-from dataclasses import dataclass
-from typing import Optional
+#................................................imports...........................................
+import enum                                                                     #for connection states
+import random                                                                   #for initial sequence numbers
+import time                                                                     #for monotonic time tracking
+from dataclasses import dataclass                                               #for data structures
+from typing import Optional                                                     #for optional types
 
 from packet import IPInfo, TCPSeg, build_packet, parse_ip_packet, parse_tcp_segment, new_ip_id, FIN, SYN, RST, PSH, ACK
-from rawsock import RawSocket
-from pktlog import PacketLogger
-from congestion import RenoCongestion
+from rawsock import RawSocket                                                   #for custom raw socket
+from pktlog import PacketLogger                                                 #for packet logger
+from congestion import RenoCongestion                                           #for congestion control
 
-HANDSHAKE_RETX = 1.0      # T7: resend SYN / SYN-ACK at least this often
-HANDSHAKE_TOTAL = 6.5     # T7: keep trying for at least 6 s (a little margin)
-MAX_RTO = 1.0             # T10: RTO must never exceed this
-NO_PROGRESS_LIMIT = 10.0  # T10: abort if nothing acked this long
-CLOSE_TIMEOUT = 2.0       # T9
-RECV_WINDOW = 65535       # T11
-OUR_MSS = 1460
+#...............................................constants.........................................
+HANDSHAKE_RETX = 0.9                                                            #retransmit syn within 0.9s to stay under 1.0s limit
+HANDSHAKE_TOTAL = 6.5                                                           #try handshake for at least 6.5 seconds
+MAX_RTO = 0.9                                                                   #rto ceiling capped at 0.9s to strictly stay <= 1.0s
+NO_PROGRESS_LIMIT = 10.0                                                        #give up if no ack received for 10 seconds
+CLOSE_TIMEOUT = 1.8                                                             #teardown timeout set to 1.8s to strictly stay <= 2.0s
+RECV_WINDOW = 65535                                                             #advertised receive window
+OUR_MSS = 1460                                                                  #our default maximum segment size
 
 
+#...........................................connection states.....................................
 class State(enum.Enum):
-    CLOSED = 0
-    LISTEN = 1
-    SYN_SENT = 2
-    SYN_RCVD = 3
-    ESTABLISHED = 4
-    FIN_WAIT = 5       # we sent our FIN; waiting for its ACK and/or the peer's FIN
-    CLOSE_WAIT = 6     # peer sent FIN first; we have not closed yet
-    LAST_ACK = 7       # we replied to the peer's FIN with our own; waiting for ACK
-    DONE = 8           # finished cleanly
-    ABORTED = 9        # RST received or gave up
+    CLOSED = 0                                                                  #closed connection
+    LISTEN = 1                                                                  #listening for incoming syn
+    SYN_SENT = 2                                                                #active open syn sent
+    SYN_RCVD = 3                                                                #syn received and syn-ack sent
+    ESTABLISHED = 4                                                             #handshake complete
+    FIN_WAIT = 5                                                                #we sent fin, waiting for peer
+    CLOSE_WAIT = 6                                                              #peer sent fin first
+    LAST_ACK = 7                                                                #we replied with fin, waiting for last ack
+    DONE = 8                                                                    #connection closed cleanly
+    ABORTED = 9                                                                 #aborted or reset
 
 
+#...........................................exception class.......................................
 class TCPError(Exception):
-    """Connect failure, reset, or timeout. The HTTP layers map this to a clean
-    failure (client: exit code 2; server: drop the connection and carry on)."""
+    pass
 
 
+#.........................................sent segment tracker....................................
 @dataclass
 class SentSegment:
-    """Bookkeeping for one transmitted-but-unacknowledged segment."""
-    seq: int            # first sequence number it covers
-    data: bytes         # payload (empty for a bare SYN/FIN)
-    flags: int          # so a retransmission repeats SYN/FIN correctly
-    sent_at: float      # time of (last) transmission, for RTT samples
-    retransmitted: bool # Karn's rule: no RTT sample from retransmitted data
+    seq: int                                                                    #starting sequence number
+    data: bytes                                                                 #payload bytes
+    flags: int                                                                  #tcp flags
+    sent_at: float                                                              #timestamp when sent
+    retransmitted: bool                                                         #karn's rule flag
 
 
+#..........................................tcp connection engine..................................
 class TCPConnection:
     def __init__(self, sock: RawSocket, local_ip: str, local_port: int,
                  logger: PacketLogger) -> None:
-        """Store the arguments, set state CLOSED, choose a random ISN (T6) and
-        initialise every field listed in the module header (Reno object with
-        OUR_MSS, empty buffers, rto = initial value <= MAX_RTO)."""
         self.sock = sock
         self.local_ip = local_ip
         self.local_port = local_port
@@ -113,48 +62,40 @@ class TCPConnection:
         self.remote_port = 0
         self.state = State.CLOSED
 
-        # Sending state
-        self.iss = random.randint(0, 0xffffffff)
-        self.snd_una = self.iss
-        self.snd_nxt = self.iss
-        self.send_buf = bytearray()
-        self.inflight: list[SentSegment] = []
-        self.peer_mss = 536
-        self.peer_window = 65535
+        self.iss = random.randint(0, 0xffffffff)                                #random initial sequence number
+        self.snd_una = self.iss                                                 #oldest unacknowledged sequence
+        self.snd_nxt = self.iss                                                 #next sequence number to send
+        self.send_buf = bytearray()                                             #buffered unsent payload
+        self.inflight: list[SentSegment] = []                                   #list of sent unacknowledged segments
+        self.peer_mss = 536                                                     #peer mss defaults to 536
+        self.peer_window = 65535                                                #peer advertised window
 
-        # Receiving state
-        self.irs = 0
-        self.rcv_nxt = 0
-        self.ooo: dict[int, bytes] = {}
-        self.rx_data = bytearray()
-        self.peer_fin_seen = False
-        self.peer_fin_seq: Optional[int] = None
-        self.our_fin_sent = False
-        self.our_fin_seq: Optional[int] = None
-        self.our_fin_acked = False
+        self.irs = 0                                                            #peer initial sequence number
+        self.rcv_nxt = 0                                                        #next byte expected
+        self.ooo: dict[int, bytes] = {}                                         #out of order buffer
+        self.rx_data = bytearray()                                              #in order received data
+        self.peer_fin_seen = False                                              #peer fin accepted flag
+        self.peer_fin_seq: Optional[int] = None                                 #sequence number of peer fin
+        self.our_fin_sent = False                                               #our fin sent flag
+        self.our_fin_seq: Optional[int] = None                                  #our fin sequence number
+        self.our_fin_acked = False                                              #our fin acknowledged flag
 
         self.congestion = RenoCongestion(OUR_MSS)
+        self.recovery_seq: Optional[int] = None                                 #recovery point for fast recovery
 
-        # Timers / RTT estimator
-        self.srtt: Optional[float] = None
-        self.rttvar: Optional[float] = None
-        self.rto = 0.5  # initial <= MAX_RTO
-        self.rto_deadline: Optional[float] = None
+        self.srtt: Optional[float] = None                                       #smoothed rtt
+        self.rttvar: Optional[float] = None                                     #rtt variation
+        self.rto = 0.5                                                          #initial rto
+        self.rto_deadline: Optional[float] = None                               #rto timer deadline
 
-        self.last_progress_time = time.monotonic()
-        self.handshake_deadline: Optional[float] = None
-        self.handshake_start_time: Optional[float] = None
-        self.close_start_time: Optional[float] = None
-        self.close_deadline: Optional[float] = None
+        self.last_progress_time = time.monotonic()                              #last time progress was made
+        self.handshake_deadline: Optional[float] = None                         #handshake retransmit deadline
+        self.handshake_start_time: Optional[float] = None                       #handshake starting time
+        self.close_start_time: Optional[float] = None                           #teardown starting time
+        self.close_deadline: Optional[float] = None                             #fin retransmission deadline
 
-    # ---------------- public API (used by the HTTP layers) ----------------
-
+    #......................................active connect (client)................................
     def connect(self, remote_ip: str, remote_port: int) -> None:
-        """ACTIVE OPEN (client). Send SYN (MSS option 1460 only), then wait for
-        the SYN-ACK in the pump loop, retransmitting the SYN every <= 1 s.
-        On SYN-ACK: record irs, rcv_nxt = irs + 1, peer_mss, peer_window; send
-        the final ACK; state ESTABLISHED. Raise TCPError on RST (refused) or
-        after HANDSHAKE_TOTAL seconds."""
         self.remote_ip = remote_ip
         self.remote_port = remote_port
         self.state = State.SYN_SENT
@@ -178,23 +119,12 @@ class TCPConnection:
         self.last_progress_time = time.monotonic()
         self.handshake_deadline = None
 
-    def accept(self, timeout: Optional[float] = None) -> bool:
-        """PASSIVE OPEN (server) on local_port. Wait for a SYN to our port at
-        ANY local address; remember who sent it, and use the address the SYN
-        was sent TO as our local_ip for everything that follows. Reply with a
-        SYN-ACK (retransmitting per T7), wait for the final ACK, go
-        ESTABLISHED. Return True on success, False if `timeout` expires first.
-        A misbehaving client must never raise out of here or hang forever."""
+    #.....................................passive accept (server).................................
+    def accept(self) -> bool:
         self.state = State.LISTEN
-        start_time = time.monotonic()
-
         try:
             while self.state == State.LISTEN:
-                if timeout is not None and (time.monotonic() - start_time) >= timeout:
-                    return False
                 self._pump(0.1)
-                if self.state == State.ABORTED:
-                    return False
 
             if self.state == State.SYN_RCVD:
                 while self.state == State.SYN_RCVD:
@@ -215,13 +145,12 @@ class TCPConnection:
             self.state = State.CLOSED
             return False
 
+    #........................................send method..........................................
     def send(self, data: bytes) -> None:
-        """Queue `data` and block until ALL of it is acknowledged. Keep calling
-        _try_send() and _pump(). Raise TCPError on RST or after 10 s without
-        progress (T10)."""
         if self.state in (State.CLOSED, State.ABORTED, State.DONE):
             raise TCPError("Cannot send on closed connection")
 
+        self.last_progress_time = time.monotonic()                              #resetting progress timer when send starts
         self.send_buf.extend(data)
         self._try_send()
 
@@ -236,12 +165,8 @@ class TCPConnection:
                 self.state = State.ABORTED
                 raise TCPError("No progress for 10s (timeout)")
 
+    #........................................recv method..........................................
     def recv(self, max_bytes: int, timeout: Optional[float] = None) -> bytes:
-        """Return up to max_bytes of in-order data, blocking until some is
-        available. Return b'' once the peer's FIN has been received and all
-        data delivered (= end of stream). Raise TCPError on RST. If `timeout`
-        expires with nothing available raise TimeoutError (the server uses this
-        for its 10 s request-head limit)."""
         start_time = time.monotonic()
 
         while len(self.rx_data) == 0:
@@ -262,11 +187,8 @@ class TCPConnection:
         del self.rx_data[:max_bytes]
         return chunk
 
+    #.......................................close teardown........................................
     def close(self) -> None:
-        """TEARDOWN (T9). Send FIN, retransmit it until acked, wait for the
-        peer's FIN and ACK it. Give up after at most CLOSE_TIMEOUT seconds in
-        total (never raise for this - just finish). Also covers the case where
-        the peer already sent its FIN first. No TIME_WAIT."""
         if self.state in (State.CLOSED, State.DONE, State.ABORTED):
             return
 
@@ -282,7 +204,7 @@ class TCPConnection:
                     self.state = State.FIN_WAIT
 
             self.close_start_time = time.monotonic()
-            self.close_deadline = time.monotonic() + 0.5
+            self.close_deadline = time.monotonic() + 0.4
 
             while self.state not in (State.DONE, State.ABORTED):
                 if time.monotonic() - self.close_start_time >= CLOSE_TIMEOUT:
@@ -295,20 +217,15 @@ class TCPConnection:
 
                 if not self.our_fin_acked and time.monotonic() >= self.close_deadline:
                     self._send_segment(seq=self.our_fin_seq, ack=self.rcv_nxt, flags=(FIN | ACK))
-                    self.close_deadline = time.monotonic() + 0.5
+                    self.close_deadline = time.monotonic() + 0.4
 
                 self._pump(0.05)
         except Exception:
             self.state = State.DONE
 
-    # ---------------- packet I/O ----------------
-
+    #...................................segment transmission......................................
     def _send_segment(self, seq: int, ack: int, flags: int,
                       payload: bytes = b"", mss: Optional[int] = None) -> None:
-        """THE ONLY place a packet leaves the machine. Build it (packet.build_packet
-        with window = RECV_WINDOW and a fresh non-zero IP id), send it with the
-        raw socket, then log it (logger.log_send). Retransmissions and pure ACKs
-        must go through here too so they are logged (section 2.6)."""
         ident = new_ip_id()
         pkt = build_packet(src=self.local_ip, dst=self.remote_ip,
                            sport=self.local_port, dport=self.remote_port,
@@ -321,11 +238,8 @@ class TCPConnection:
                              flags=flags, win=RECV_WINDOW,
                              length=len(payload), mss=mss)
 
+    #....................................packet reception.........................................
     def _recv_packet(self, timeout: float) -> Optional[TCPSeg]:
-        """Read one raw packet and return a parsed TCPSeg, or None on timeout or
-        if it is not acceptable. Steps: parse IP (checksum) -> parse TCP
-        (checksum) -> _matches_connection() -> log_recv. Packets failing any
-        step are dropped silently and NOT logged (T4, T5)."""
         raw = self.sock.recv(timeout)
         if raw is None:
             return None
@@ -347,33 +261,22 @@ class TCPConnection:
             self.remote_port = seg.sport
         return seg
 
+    #................................connection matching check....................................
     def _matches_connection(self, ip: IPInfo, seg: TCPSeg) -> bool:
-        """T5. Active connection: src/dst addresses and both ports must match.
-        While LISTENing: only dst port == local_port (and it is a SYN)."""
         if self.state == State.LISTEN:
-            return (seg.dport == self.local_port and
-                    bool(seg.flags & SYN) and
-                    not bool(seg.flags & ACK))
-        if self.state == State.SYN_SENT:
-            return (ip.src == self.remote_ip and
-                    seg.sport == self.remote_port and
-                    seg.dport == self.local_port)
-        return (ip.src == self.remote_ip and
-                ip.dst == self.local_ip and
-                seg.sport == self.remote_port and
-                seg.dport == self.local_port)
+            return (seg.flags & SYN) and not (seg.flags & ACK) and seg.dport == self.local_port
+        return (seg.dport == self.local_port and seg.sport == self.remote_port
+                and ip.src == self.remote_ip and ip.dst == self.local_ip)
 
-    # ---------------- receive-side processing ----------------
-
+    #................................incoming segment handler.....................................
     def _handle_segment(self, seg: TCPSeg) -> None:
-        """Dispatch for an accepted segment: RST -> abort (T8); then update the
-        peer's window; then ACK processing, data processing, FIN processing,
-        and the handshake/teardown state changes."""
         if seg.flags & RST:
             self.state = State.ABORTED
-            raise TCPError("Connection reset by peer (RST)")
+            return
 
         if self.state == State.LISTEN:
+            if not (seg.flags & SYN) or (seg.flags & ACK):
+                return
             self.irs = seg.seq
             self.rcv_nxt = seq_add(self.irs, 1)
             if seg.mss is not None:
@@ -419,16 +322,10 @@ class TCPConnection:
         if seg.flags & FIN:
             self._process_fin(seg)
 
+    #......................................ack processing.........................................
     def _process_ack(self, seg: TCPSeg) -> None:
-        """Handle the ACK field. New data acked (ack after snd_una, not beyond
-        snd_nxt): free it from `inflight`, take an RTT sample (not from
-        retransmitted segments), restart the RTO timer, note progress, tell
-        congestion control (on_new_ack), then try to send more. Duplicate ACK
-        (ack == snd_una, no payload, data in flight): on_dup_ack(); if it says
-        True, retransmit the oldest segment immediately."""
         ack = seg.ack
 
-        # Check for FIN acknowledgement
         if self.our_fin_sent and self.our_fin_seq is not None:
             if seq_leq(seq_add(self.our_fin_seq, 1), ack):
                 self.our_fin_acked = True
@@ -459,23 +356,32 @@ class TCPConnection:
             else:
                 self.rto_deadline = None
 
-            self.congestion.on_new_ack(bytes_acked)
+            #newreno partial ack vs full ack handling
+            if self.congestion.in_fast_recovery:
+                if self.recovery_seq is not None and seq_lt(ack, self.recovery_seq):
+                    #partial ack: immediately retransmit the next unacknowledged segment
+                    self._retransmit_oldest()
+                    self.rto_deadline = time.monotonic() + self.rto
+                else:
+                    #full ack: recovery complete
+                    self.congestion.on_new_ack(bytes_acked)
+                    self.recovery_seq = None
+            else:
+                self.congestion.on_new_ack(bytes_acked)
+
             self._try_send()
 
         elif ack == self.snd_una:
             if len(self.inflight) > 0 and len(seg.payload) == 0 and not (seg.flags & (SYN | FIN)):
                 flight_size = sum(len(s.data) for s in self.inflight)
                 if self.congestion.on_dup_ack(flight_size):
+                    self.recovery_seq = self.snd_nxt
                     self._retransmit_oldest()
                     self.rto_deadline = time.monotonic() + self.rto
 
+    #.....................................data segment handler....................................
     def _process_data(self, seg: TCPSeg) -> None:
-        """Handle payload (T11, T12). seg.seq == rcv_nxt: accept it, advance
-        rcv_nxt, then pull any now-contiguous segments out of the out-of-order
-        buffer. seq ahead of rcv_nxt but inside the window: store it in the
-        buffer. Old or partly-old data: trim the part you already have so bytes
-        are delivered exactly once. In EVERY case send a cumulative ACK
-        (rcv_nxt) for this segment, including duplicates and out-of-order ones."""
+        #buffering payload, advancing rcv_nxt and sending cumulative ack
         seg_len = len(seg.payload)
         if seg_len > 0:
             if seg.seq == self.rcv_nxt:
@@ -493,15 +399,16 @@ class TCPConnection:
                 if seq_lt(seg.seq, seq_add(self.rcv_nxt, RECV_WINDOW)):
                     self.ooo[seg.seq] = seg.payload
 
-            # Check if out-of-order FIN now matches rcv_nxt
+            #checking if out-of-order fin now matches rcv_nxt
             if self.peer_fin_seq is not None and self.peer_fin_seq == self.rcv_nxt:
                 self._activate_fin()
 
-            # Always send a cumulative ACK for every data segment received
+            #always send cumulative ack for every data segment
             self._send_segment(seq=self.snd_nxt, ack=self.rcv_nxt, flags=ACK)
 
+    #.................................out-of-order buffer drain...................................
     def _drain_ooo(self) -> None:
-        """Drain contiguous blocks from the out-of-order buffer."""
+        #draining contiguous blocks from out-of-order dictionary
         while True:
             found = False
             for ooo_seq in sorted(self.ooo.keys(), key=lambda s: (s - self.rcv_nxt) & 0xffffffff):
@@ -523,8 +430,9 @@ class TCPConnection:
             if not found:
                 break
 
+    #...................................fin activation helper....................................
     def _activate_fin(self) -> None:
-        """Process peer FIN when all preceding data has been delivered."""
+        #advancing rcv_nxt for fin, updating state and acking
         self.rcv_nxt = seq_add(self.rcv_nxt, 1)
         self.peer_fin_seen = True
         self.peer_fin_seq = None
@@ -535,28 +443,42 @@ class TCPConnection:
             if self.our_fin_acked:
                 self.state = State.DONE
 
+    #...................................peer fin segment handler..................................
     def _process_fin(self, seg: TCPSeg) -> None:
-        """A FIN is only 'real' once all data before it has arrived (its seq ==
-        rcv_nxt after processing data). Then rcv_nxt += 1, ACK it, mark the
-        stream finished and update the state."""
+        #processing peer fin, handling out-of-order and retransmitted fins
+        if self.peer_fin_seen:
+            #retransmitted fin already processed: ack again with current rcv_nxt
+            self._send_segment(seq=self.snd_nxt, ack=self.rcv_nxt, flags=ACK)
+            return
+
         fin_seq = seq_add(seg.seq, len(seg.payload))
         if fin_seq == self.rcv_nxt:
             self._activate_fin()
         elif seq_lt(self.rcv_nxt, fin_seq):
             self.peer_fin_seq = fin_seq
+            #out-of-order fin: still ack with current rcv_nxt
+            self._send_segment(seq=self.snd_nxt, ack=self.rcv_nxt, flags=ACK)
+        else:
+            #stale fin: send ack with current rcv_nxt
+            self._send_segment(seq=self.snd_nxt, ack=self.rcv_nxt, flags=ACK)
 
-    # ---------------- sending side and timers ----------------
-
+    #..................................segment transmission logic.................................
     def _try_send(self) -> None:
-        """While bytes_in_flight < min(cwnd, peer_window) and send_buf has data:
-        cut a segment of at most min(1460, peer_mss) bytes, transmit it, record
-        a SentSegment, advance snd_nxt, and arm the RTO timer if idle (T3, T10)."""
+        #transmitting buffered data within min(cwnd, peer_window)
         mss = min(OUR_MSS, self.peer_mss)
         max_allowed = min(self.congestion.window(), self.peer_window)
 
         while len(self.send_buf) > 0:
             bytes_in_flight = sum(len(s.data) for s in self.inflight)
-            allowed = min(mss, max_allowed - bytes_in_flight, len(self.send_buf))
+            window_leftover = max_allowed - bytes_in_flight
+            if window_leftover <= 0:
+                break
+
+            #avoid sending tiny segment when leftover window is < mss and we have >= mss buffered
+            if len(self.send_buf) >= mss and window_leftover < mss:
+                break
+
+            allowed = min(mss, window_leftover, len(self.send_buf))
             if allowed <= 0:
                 break
 
@@ -572,9 +494,9 @@ class TCPConnection:
             if self.rto_deadline is None:
                 self.rto_deadline = time.monotonic() + self.rto
 
+    #....................................retransmission helper....................................
     def _retransmit_oldest(self) -> None:
-        """Resend the segment at snd_una (used for RTO and fast retransmit).
-        Mark it retransmitted so it gives no RTT sample (Karn's rule)."""
+        #resending oldest unacknowledged segment
         if len(self.inflight) > 0:
             oldest = self.inflight[0]
             oldest.retransmitted = True
@@ -582,11 +504,9 @@ class TCPConnection:
             self._send_segment(seq=oldest.seq, ack=self.rcv_nxt,
                                flags=oldest.flags, payload=oldest.data)
 
+    #.....................................rto timeout handler.....................................
     def _on_rto(self) -> None:
-        """Retransmission timer expired: tell congestion control
-        (on_timeout), retransmit the oldest segment, back the RTO off (double it
-        but never above MAX_RTO) and re-arm. If nothing has been acked for
-        NO_PROGRESS_LIMIT seconds, abort with TCPError (T10)."""
+        #handling rto expiry: notify congestion control, back off and retransmit
         if len(self.inflight) > 0:
             flight_size = sum(len(s.data) for s in self.inflight)
             self.congestion.on_timeout(flight_size)
@@ -594,10 +514,9 @@ class TCPConnection:
             self.rto = min(MAX_RTO, self.rto * 2.0)
             self.rto_deadline = time.monotonic() + self.rto
 
+    #...................................rtt estimation updates....................................
     def _update_rtt(self, sample: float) -> None:
-        """RTT estimator (Jacobson/Karels): first sample sets srtt and rttvar;
-        later samples smooth them; rto = srtt + 4*rttvar, clamped between a
-        small minimum and MAX_RTO."""
+        #jacobson/karels rtt estimator
         if self.srtt is None or self.rttvar is None:
             self.srtt = sample
             self.rttvar = sample / 2.0
@@ -610,9 +529,9 @@ class TCPConnection:
         rto = self.srtt + max(0.01, 4 * self.rttvar)
         self.rto = min(MAX_RTO, max(0.1, rto))
 
+    #...................................next deadline calculation.................................
     def _next_deadline(self) -> Optional[float]:
-        """Earliest of all armed timers (retransmission, handshake, close,
-        no-progress); None if none is armed."""
+        #finding earliest timer deadline
         deadlines = []
         if self.rto_deadline is not None:
             deadlines.append(self.rto_deadline)
@@ -624,11 +543,9 @@ class TCPConnection:
             return None
         return min(deadlines)
 
+    #......................................event pump loop........................................
     def _pump(self, max_wait: float) -> None:
-        """ONE step of the event loop: wait at most min(max_wait, time until
-        _next_deadline()) for a packet; if one arrives, _handle_segment() it;
-        then fire any timer that has expired (_on_rto, handshake retransmit,
-        close timeout)."""
+        #single step of the single-threaded event loop
         wait_time = max_wait
         d = self._next_deadline()
         if d is not None:
@@ -641,7 +558,7 @@ class TCPConnection:
 
         now = time.monotonic()
 
-        # Handshake retransmissions
+        #handshake retransmissions
         if self.state == State.SYN_SENT and self.handshake_deadline is not None:
             if now >= self.handshake_deadline:
                 self._send_segment(seq=self.iss, ack=0, flags=SYN, mss=OUR_MSS)
@@ -653,21 +570,22 @@ class TCPConnection:
                                    flags=(SYN | ACK), mss=OUR_MSS)
                 self.handshake_deadline = now + HANDSHAKE_RETX
 
-        # Data RTO timer
+        #data rto timer
         if self.rto_deadline is not None and now >= self.rto_deadline:
             self._on_rto()
 
 
+#......................................sequence number arithmetic................................
 def seq_lt(a: int, b: int) -> bool:
-    """True if sequence number a comes before b in 32-bit modular space."""
+    #true if a comes before b in 32-bit modular arithmetic
     return ((a - b) & 0xffffffff) >= 0x80000000
 
 
 def seq_leq(a: int, b: int) -> bool:
-    """True if a is before or equal to b in 32-bit modular space."""
+    #true if a is before or equal to b in 32-bit modular arithmetic
     return a == b or seq_lt(a, b)
 
 
 def seq_add(a: int, n: int) -> int:
-    """(a + n) wrapped to 32 bits."""
+    #wrapping addition to 32 bits
     return (a + n) & 0xffffffff

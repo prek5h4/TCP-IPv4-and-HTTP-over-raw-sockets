@@ -11,14 +11,13 @@ ip link set dev "$IF_B" up
 ip link set dev "$IF_C" up
 ip link set dev "$IF_D" up
 
-# Router (A4)
+#.......................................................Router(A4)...........................................................
 sysctl -w net.ipv4.ip_forward=1
 
-# LAN A via r1; client's own address via Link D (more specific, so it wins).
-# No default route (A6).
+#.......................LAN A via r1, client's own address via Link D..................................
+#.......................................................No default route(A6).................................................
 ip route add 10.10.1.0/24 via 10.10.2.1
 ip route add 10.10.1.10/32 via 10.10.4.2
 
-# Client traffic arrives on LAN B (via r1) but r2's route back to the client
-# is Link D, so strict rp_filter would drop it. Loose (2) on IF_B only.
+#.......................Client traffic arrives on LAN B (via r1) but r2's route back to the client.................................
 sysctl -w net.ipv4.conf."$IF_B".rp_filter=2
