@@ -157,8 +157,8 @@ def main() -> int:
 
     try:
         args = parser.parse_args()                                              #parsing cli arguments
-    except SystemExit:
-        return 2
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) and e.code == 0 else 2
 
     try:
         host, port, path, host_hdr = parse_url(args.url)                        #parsing the given url
