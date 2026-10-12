@@ -170,6 +170,47 @@ The scripts in {netcfg/} configure addresses, routes, forwarding, and reverse-pa
     \item \textbf{server.sh:} Configures 10.10.3.10/24, disables forwarding, sets the default route via 10.10.3.1, and retains strict filtering.
 \end{itemize}
 
+\subsection{Hypervisor Network Adapter Configuration (UTM / QEMU)}
+
+In UTM on Apple Silicon macOS, isolated internal networks are provisioned using isolated point-to-point network devices without host adapters or DHCP servers, as approved by the course staff. Each virtual machine's network links are configured through UTM's QEMU Arguments pane with explicit \texttt{-device virtio-net-pci} and corresponding \texttt{-netdev} specifications matching the assigned network interfaces.
+
+\begin{figure}[H]
+    \centering
+    \begin{minipage}[t]{0.48\textwidth}
+        \centering
+        \textbf{Client VM}\\[3pt]
+        \includegraphics[width=\textwidth]{client_qemu.jpeg}
+    \end{minipage}
+    \hfill
+    \begin{minipage}[t]{0.48\textwidth}
+        \centering
+        \textbf{Router R1 VM}\\[3pt]
+        \includegraphics[width=\textwidth]{r1_qemu.jpeg}
+    \end{minipage}
+    \vspace{8pt}
+    
+    \begin{minipage}[t]{0.48\textwidth}
+        \centering
+        \textbf{Router R2 VM (Part 1)}\\[3pt]
+        \includegraphics[width=\textwidth]{r2_qemu_1.jpeg}
+    \end{minipage}
+    \hfill
+    \begin{minipage}[t]{0.48\textwidth}
+        \centering
+        \textbf{Router R2 VM (Part 2)}\\[3pt]
+        \includegraphics[width=\textwidth]{r2_qemu_2.jpeg}
+    \end{minipage}
+    \vspace{8pt}
+    
+    \begin{minipage}[t]{0.52\textwidth}
+        \centering
+        \textbf{Server VM}\\[3pt]
+        \includegraphics[width=\textwidth]{server_qemu.jpeg}
+    \end{minipage}
+    \caption{UTM QEMU Arguments settings showing \texttt{-device} and \texttt{-netdev} adapter configurations for all four virtual machines.}
+    \label{fig:utm_qemu_adapters}
+\end{figure}
+
 \subsection{Configuration Evidence and Verification}
 
 We ran the configuration scripts and checked interface addresses, routes, and link states on both laptop environments. 
