@@ -10,16 +10,20 @@ This assignment implements a basic TCP/IPv4 transport layer and an HTTP client-s
 
 The HTTP client can request files from an HTTP server, while the server handles requests and serves files from its document root. The implementation uses Python's standard library without third-party networking or HTTP packages.
 
-## 2. Language and Requirements
+## 2. Environment, Language, and Setup
 
+### Environment and VM Setup
+- **Operating System:** Ubuntu 22.04 LTS (`ubuntu-22.04.5-live-server-arm64`)
+- **Architecture:** ARM64 (`aarch64`), developed and tested using native virtualization on Apple Silicon (macOS); code is architecture-independent and fully compatible with x86-64 evaluation environments.
+- **Hypervisor:** UTM with 4 separate guest virtual machines (`client`, `r1`, `r2`, `server`).
+- **Virtual Networks:** 4 isolated internal networks (LAN A, LAN B, LAN C, and Link D) configured with static addressing, without DHCP or internet access.
+- **Privileges:** Root / `sudo` privileges are required to create raw sockets (`AF_INET`, `SOCK_RAW`, `IP_HDRINCL`) and execute routing and `sysctl` commands.
+
+### Language and Runtime
 - **Language:** Python 3
-- **Target environment:** Ubuntu 22.04 LTS (x86-64 or ARM64)
-- **Python version:** Python 3.10 or later
-- **Dependencies:** Python standard library only
-
-The programs use modules such as `socket`, `struct`, `select`, `argparse`, `time`, `random`, `dataclasses`, `enum`, `os`, and `sys`.
-
-No compilation or package installation is required. Since raw sockets are used, the client and server should be launched with root privileges.
+- **Python Version:** Python 3.10 or later
+- **Dependencies:** Python standard library only (`socket`, `struct`, `select`, `argparse`, `time`, `random`, `dataclasses`, `enum`, `os`, `sys`). No third-party networking or packet libraries are used.
+- **Compilation:** No compilation or build step required; Python scripts are executed directly via the launcher scripts.
 
 ## 3. File Structure
 
